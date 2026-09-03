@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semsplat"
+version = "0.1.0"
+description = "Open-vocabulary semantic 3DGS on nerfstudio Splatfacto/gsplat (Feature-3DGS-style per-Gaussian CLIP-feature distillation)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "gs-slam project" }]
+dependencies = [
+    "nerfstudio==1.1.5",
+    "gsplat==1.4.0",
+    "torch>=2.7",
+    "torchvision",
+    "transformers>=4.40",
+    "plyfile",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ninja"]
+
+[project.scripts]
+"semsplat-query" = "semsplat.inference.query_cli:main"
+
+[project.entry-points."nerfstudio.method_configs"]
+"semsplat" = "semsplat.semsplat_config:semsplat_method"
+"semsplat-replica" = "semsplat.semsplat_config:semsplat_replica_method"
+
+[tool.setuptools.packages.find]
+include = ["semsplat*"]
+
+[tool.setuptools.dynamic]
+# version read from semsplat/__init__.py? keep static above.

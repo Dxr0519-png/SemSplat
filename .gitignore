@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# env / tooling
+.venv/
+.idea/
+.pytest_cache/
+
+# data & outputs
+data/
+datasets/
+outputs/
+results/
+*.ply
+
+# os
+.DS_Store
