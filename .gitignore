@@ -1,22 +1,44 @@
-# python
+# ============ Python ============
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 .eggs/
 build/
 dist/
 
-# env / tooling
+# 编译产物（torch / CUDA 扩展、gsplat 源码构建等）
+*.so
+*.o
+
+# ============ venv / IDE / 工具 ============
 .venv/
+venv/
 .idea/
+.vscode/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
 
-# data & outputs
-data/
-datasets/
-outputs/
-results/
+# ============ 数据与训练产物（只忽略仓库顶层，避免吞掉包内同名字目录） ============
+/data/
+/datasets/
+/outputs/
+/results/
+
+# 点云 / 权重 / 检查点
 *.ply
+*.pt
+*.pth
+*.ckpt
 
-# os
+# ============ 日志 / 追踪 ============
+wandb/
+*.log
+.ipynb_checkpoints/
+
+# ============ OS ============
 .DS_Store

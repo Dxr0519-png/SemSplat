@@ -72,8 +72,32 @@ class SemsplatSplatfactoModelConfig(SplatfactoModelConfig):
     """Learning-rate multiplier applied to the sem_features group's optimizer LR."""
 
     # ---- teacher ----
+    teacher_kind: str = "clip"
+    """'clip' = OpenAI-CLIP patch | 'lseg' | 'superclip' = SLIC+CLIP | 'samclip' = SAM+CLIP."""
+    teacher_sam_model_name: str = "facebook/sam-vit-base"
+    """HF SAM checkpoint used for whole-object masks (samclip)."""
+    teacher_sam_grid: int = 6
+    """grid x grid SAM point prompts (samclip)."""
+    teacher_sam_iou_thr: float = 0.86
+    """Keep SAM masks whose predicted IoU >= thr (samclip)."""
+    teacher_sam_mask_bg: float = 0.5
+    """Crop background value 0..1 for CLIP crops (0 black, 0.5 neutral gray)."""
+    teacher_slic_n_segments: int = 250
+    """SLIC superpixel count for the superclip teacher."""
+    teacher_slic_compactness: float = 10.0
+    """SLIC compactness for the superclip teacher."""
     teacher_model_name: str = "openai/clip-vit-base-patch16"
-    """HuggingFace OpenAI CLIP checkpoint used as dense local-feature teacher."""
+    """HuggingFace OpenAI CLIP checkpoint used as dense local-feature teacher (clip kind)."""
+    teacher_text_model_name: Optional[str] = None
+    """Optional override for the query text encoder; None resolves from teacher_kind."""
+    teacher_lseg_ckpt: str = "data/checkpoints/lseg/demo_e200.ckpt"
+    """Feature-3DGS/isl-org LSeg checkpoint (clip_vitl16_384 + demo_e200)."""
+    teacher_lseg_input_long_side: int = 384
+    """Long side (px) the LSeg teacher resizes training images to."""
+    teacher_lseg_cell: int = 8
+    """Average-pool teacher pixels into ~input_long_side/cell supervision grid."""
+    teacher_lseg_l2norm: bool = True
+    """Channel-L2-normalize LSeg per-pixel features before pooling."""
     teacher_cache_fp16: bool = True
     """Cache teacher grids in fp16 to save VRAM."""
     teacher_cache_max_entries: int = 2000
@@ -87,7 +111,7 @@ class SemsplatModel(SplatfactoModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._clip_teacher = None  # lazy; NOT a submodule so it is never serialized
+        self._teacher = None  # lazy; NOT a submodule so it is never serialized
         self._last_cam_idx: Optional[int] = None
 
     # ------------------------------------------------------------------ setup
@@ -290,22 +314,60 @@ class SemsplatModel(SplatfactoModel):
 
     # ------------------------------------------------------------------ losses
     def _get_teacher(self):
-        """Lazily build the frozen CLIP teacher (not part of the model graph)."""
-        if self._clip_teacher is None:
-            from semsplat.teachers.clip_local_teacher import ClipLocalTeacher
+        """Lazily build the frozen teacher (clip | lseg), not part of the model graph."""
+        if self._teacher is None:
+            cfg = self.config
+            if cfg.teacher_kind == "lseg":
+                from semsplat.teachers.lseg_local_teacher import LSegDenseTeacher
 
-            self._clip_teacher = ClipLocalTeacher(
-                model_name=self.config.teacher_model_name,
-                fp16=self.config.teacher_cache_fp16,
-                max_entries=self.config.teacher_cache_max_entries,
-                device=self.device,
-            )
-            if self._clip_teacher.dim != self.config.semantic_head_dim:
-                raise ValueError(
-                    f"teacher dim {self._clip_teacher.dim} != semantic_head_dim "
-                    f"{self.config.semantic_head_dim}; set semantic_head_dim accordingly."
+                self._teacher = LSegDenseTeacher(
+                    ckpt_path=cfg.teacher_lseg_ckpt,
+                    input_long_side=cfg.teacher_lseg_input_long_side,
+                    cell=cfg.teacher_lseg_cell,
+                    l2norm=cfg.teacher_lseg_l2norm,
+                    fp16=cfg.teacher_cache_fp16,
+                    max_entries=cfg.teacher_cache_max_entries,
+                    device=str(self.device),
                 )
-        return self._clip_teacher
+            elif cfg.teacher_kind == "superclip":
+                from semsplat.teachers.slic_clip_teacher import SuperClipTeacher
+
+                self._teacher = SuperClipTeacher(
+                    image_model_name=cfg.teacher_model_name,
+                    n_segments=cfg.teacher_slic_n_segments,
+                    compactness=cfg.teacher_slic_compactness,
+                    fp16=cfg.teacher_cache_fp16,
+                    max_entries=cfg.teacher_cache_max_entries,
+                    device=str(self.device),
+                )
+            elif cfg.teacher_kind == "samclip":
+                from semsplat.teachers.sam_clip_teacher import SamClipTeacher
+
+                self._teacher = SamClipTeacher(
+                    image_model_name=cfg.teacher_model_name,
+                    sam_model_name=cfg.teacher_sam_model_name,
+                    grid=cfg.teacher_sam_grid,
+                    iou_thr=cfg.teacher_sam_iou_thr,
+                    mask_bg=cfg.teacher_sam_mask_bg,
+                    fp16=cfg.teacher_cache_fp16,
+                    max_entries=cfg.teacher_cache_max_entries,
+                    device=str(self.device),
+                )
+            else:
+                from semsplat.teachers.clip_local_teacher import ClipLocalTeacher
+
+                self._teacher = ClipLocalTeacher(
+                    model_name=cfg.teacher_model_name,
+                    fp16=cfg.teacher_cache_fp16,
+                    max_entries=cfg.teacher_cache_max_entries,
+                    device=str(self.device),
+                )
+            if self._teacher.dim != cfg.semantic_head_dim:
+                raise ValueError(
+                    f"teacher dim {self._teacher.dim} != semantic_head_dim "
+                    f"{cfg.semantic_head_dim}; set semantic_head_dim accordingly."
+                )
+        return self._teacher
 
     @staticmethod
     def _l2norm(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -328,18 +390,25 @@ class SemsplatModel(SplatfactoModel):
         grid = teacher.compute(gt_img, key=self._last_cam_idx)  # [gH,gW,M]
 
         gH, gW, M = grid.shape
-        pred = self.feature_head(feat_map)  # [H,W,M]
-        # area-pool predicted features + alpha to the teacher's patch grid
+        # area-pool the K-dim map, then decode to M (linear + avg-pool commute, so
+        # this avoids materializing the [H,W,M] tensor before pooling)
         pred_pooled = F.adaptive_avg_pool2d(
-            pred.permute(2, 0, 1)[None, ...], (gH, gW)
-        )[0].permute(1, 2, 0)  # [gH,gW,M]
+            feat_map.permute(2, 0, 1)[None, ...], (gH, gW)
+        )[0].permute(1, 2, 0)  # [gH,gW,K]
+        pred_pooled = self.feature_head(pred_pooled)  # [gH,gW,M]
         alpha_pooled = F.adaptive_avg_pool2d(
             feat_alpha.permute(2, 0, 1)[None, ...], (gH, gW)
         )[0].permute(1, 2, 0)  # [gH,gW,1]
 
         pred_n = self._l2norm(pred_pooled)
         tgt_n = self._l2norm(grid)
-        mask = alpha_pooled > 0.5  # valid (covered) patch cells
+        mask = alpha_pooled > 0.5  # geometry coverage
+        cov_fn = getattr(teacher, "coverage", None)
+        if cov_fn is not None:
+            cov = cov_fn(gt_img, key=self._last_cam_idx)  # [gH,gW]
+            if cov.ndim == 2:
+                cov = cov[..., None]
+            mask = mask & (cov > 0.4)
 
         loss_type = self.config.semantic_loss_type
         if loss_type == "cos":

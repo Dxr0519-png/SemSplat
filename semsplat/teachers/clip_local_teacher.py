@@ -115,6 +115,22 @@ def load_clip(model_name: str = "openai/clip-vit-base-patch16", fp16: bool = Fal
     return model
 
 
+# Feature-3DGS's LSeg (clip_vitl16_384) is trained against OpenAI CLIP *base* text
+# (their loader uses clip.load("ViT-B/32")). OpenAI's ViT-B/16 and ViT-B/32 HF
+# checkpoints share the SAME text tower, so the existing default also serves the
+# LSeg teacher's query space.
+LSEG_TEXT_MODEL = "openai/clip-vit-base-patch16"
+
+
+def resolve_text_model_name(config) -> str:
+    """Pick the text encoder for a run's teacher kind (see config knobs)."""
+    if getattr(config, "teacher_text_model_name", None):
+        return config.teacher_text_model_name
+    if getattr(config, "teacher_kind", "clip") == "lseg":
+        return LSEG_TEXT_MODEL
+    return getattr(config, "teacher_model_name", "openai/clip-vit-base-patch16")
+
+
 @torch.no_grad()
 def encode_text_prompts(
     prompts, model_name: str = "openai/clip-vit-base-patch16", device: str = "cuda"

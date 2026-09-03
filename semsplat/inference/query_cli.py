@@ -24,7 +24,7 @@ from nerfstudio.utils.eval_utils import eval_setup
 
 from semsplat.inference import scoring
 from semsplat.inference.ply_writer import write_semantic_ply
-from semsplat.teachers.clip_local_teacher import encode_text_prompts
+from semsplat.teachers.clip_local_teacher import encode_text_prompts, resolve_text_model_name
 
 
 def _palette(n: int) -> np.ndarray:
@@ -65,7 +65,8 @@ def main() -> None:
     device = model.device
 
     print(">> encoding text prompts:", prompts)
-    emb_dict = encode_text_prompts(prompts, model.config.teacher_model_name, device=str(device))
+    text_model = resolve_text_model_name(model.config)
+    emb_dict = encode_text_prompts(prompts, text_model, device=str(device))
     emb = torch.stack([emb_dict[p] for p in prompts], dim=0).to(device)  # [C,M]
 
     # per-Gaussian best class (for the PLY export) -----------------------------

@@ -39,7 +39,32 @@ def test_optimizer_groups_match_param_groups():
         }
         # semantic head dim matches the CLIP teacher projection dim (512)
         assert model.semantic_head_dim == 512
+        assert model.teacher_kind == "clip"
         assert model.teacher_model_name == "openai/clip-vit-base-patch16"
+
+
+def test_lseg_config_constructs():
+    """teacher_kind='lseg' constructs with the same 512-dim invariant (no GPU)."""
+    cfg = SemsplatSplatfactoModelConfig(teacher_kind="lseg")
+    assert cfg.teacher_kind == "lseg"
+    assert cfg.semantic_head_dim == 512
+    assert cfg.teacher_lseg_ckpt.endswith("demo_e200.ckpt")
+
+
+def test_superclip_config_constructs():
+    """teacher_kind='superclip' constructs with the same 512-dim invariant (no GPU)."""
+    cfg = SemsplatSplatfactoModelConfig(teacher_kind="superclip")
+    assert cfg.teacher_kind == "superclip"
+    assert cfg.semantic_head_dim == 512
+    assert cfg.teacher_slic_n_segments > 0
+
+
+def test_samclip_config_constructs():
+    """teacher_kind='samclip' constructs with the same 512-dim invariant (no GPU)."""
+    cfg = SemsplatSplatfactoModelConfig(teacher_kind="samclip")
+    assert cfg.teacher_kind == "samclip"
+    assert cfg.semantic_head_dim == 512
+    assert cfg.teacher_sam_grid > 0
 
 
 if __name__ == "__main__":

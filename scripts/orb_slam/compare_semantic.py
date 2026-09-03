@@ -27,7 +27,7 @@ torch.load = lambda *a, **k: _torch_load(*a, **{**k, "weights_only": False})
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.utils.eval_utils import eval_setup
 from semsplat.inference import scoring
-from semsplat.teachers.clip_local_teacher import encode_text_prompts
+from semsplat.teachers.clip_local_teacher import encode_text_prompts, resolve_text_model_name
 
 
 def _palette(n: int) -> np.ndarray:
@@ -99,7 +99,7 @@ def main() -> None:
         _, pipeline, _, _ = eval_setup(cfg)
         model = pipeline.model
         model.eval()
-        teacher = model.config.teacher_model_name
+        teacher = resolve_text_model_name(model.config)
         print("   encode prompts via", teacher)
         emb = torch.stack([encode_text_prompts(prompts, teacher)[p] for p in prompts], dim=0).to(device)
         for idx in args.frames:
