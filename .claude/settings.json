@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /home/dxr/my_project/gs-slam; rm -rf /tmp/cln_out; .venv/bin/python scripts/orb_slam/cleanup_sem_maps.py --in-dir results/orb_ate/sem_bg_320_001 --out-dir /tmp/cln_out --frames 2 50 150 250 --gt-dir data/office0_est320/frames/semantic --gt-ids 76 20 80 34 44 93 40 31 2>&1 | head -40)",
+      "Bash(export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1)",
+      "Bash(chmod +x /tmp/ab_6k.sh)",
+      "Bash(bash /tmp/ab_6k.sh)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader)",
+      "Bash(bash /tmp/eval_ab_6k.sh)",
+      "Bash(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python /tmp/vis_ab.py --configs outputs/office0_320_sam6k/office0_est320_ns/semsplat-replica/2026-09-04_104210/config.yml outputs/sam6k_ab/ctx/office0_est320_ns/semsplat-replica/2026-09-04_135643/config.yml outputs/sam6k_ab/wallfold/office0_est320_ns/semsplat-replica/2026-09-04_142739/config.yml --names baseline ctx wallfold --frames 0 45 90 120 150 200 260)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(xdg-open results/orb_ate/vis_ab/index.html)",
+      "Bash(open results/orb_ate/vis_ab/index.html)",
+      "Bash(rm -f results/orb_ate/sam6k_ab_ctx_*.txt)",
+      "Bash(rm -f results/orb_ate/vis_ab/*_ctx_*.png)",
+      "Bash(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python /tmp/dump_base_npz.py)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

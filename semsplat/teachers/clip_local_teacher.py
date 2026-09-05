@@ -133,17 +133,32 @@ def resolve_text_model_name(config) -> str:
 
 @torch.no_grad()
 def encode_text_prompts(
-    prompts, model_name: str = "openai/clip-vit-base-patch16", device: str = "cuda"
+    prompts,
+    model_name: str = "openai/clip-vit-base-patch16",
+    device: str = "cuda",
+    clip_model=None,
 ) -> Dict[str, torch.Tensor]:
-    """L2-normalized text embeddings (in CLIP's projected space) for each prompt."""
+    """L2-normalized text embeddings (in CLIP's projected space) for each prompt.
+
+    ``clip_model`` is a reusable in-VRAM frozen CLIPModel (e.g. a teacher's image
+    tower) -- when given, it is used as-is instead of loading a fresh fp32 copy
+    per call (the per-call ``load_clip`` would otherwise risk OOM on small GPUs
+    when invoked lazily inside training). The tokenizer is still built from
+    ``model_name`` (cheap; prompt sets are cached so this runs ~once per run).
+    """
     from transformers import CLIPTokenizer  # local import kept near usage
 
     tokenizer = CLIPTokenizer.from_pretrained(model_name)
-    model = load_clip(model_name, fp16=False, device=device)
+    if clip_model is not None:
+        model = clip_model
+        dev = next(model.parameters()).device
+    else:
+        model = load_clip(model_name, fp16=False, device=device)
+        dev = torch.device(device)
 
     out = {}
     for p in prompts:
-        tokens = tokenizer(p, return_tensors="pt", padding=True, truncation=True).to(device)
+        tokens = tokenizer(p, return_tensors="pt", padding=True, truncation=True).to(dev)
         pooled = model.text_model(**tokens).pooler_output  # [1, hidden]
         emb = model.text_projection(pooled)  # [1, proj]
         out[p] = F.normalize(emb.float(), dim=-1)[0]

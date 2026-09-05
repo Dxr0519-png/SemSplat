@@ -26,7 +26,8 @@ the pin changes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Type, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Type, Union
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +42,11 @@ from nerfstudio.models.splatfacto import (
 )
 from nerfstudio.utils.rich_utils import CONSOLE
 from gsplat.rendering import rasterization
+
+from semsplat.losses import (
+    depth_aware_tv_loss,
+    opacity_entropy_loss,
+)
 
 EPS = 1e-6
 
@@ -71,6 +77,21 @@ class SemsplatSplatfactoModelConfig(SplatfactoModelConfig):
     semantic_feature_lr_mult: float = 1.0
     """Learning-rate multiplier applied to the sem_features group's optimizer LR."""
 
+    # ---- spatial regularizers (polish; both default OFF so old configs/checkpoints
+    #      stay byte-comparable) ----
+    sem_tv_mult: float = 0.0
+    """Weight of the full-res depth-aware TV smoothness on the rendered K-dim feature
+    map (0 = off). When >0 the semantic feature pass renders RGB+ED to also emit depth."""
+    sem_tv_depth_sigma: float = 0.1
+    """Depth-continuity sigma (metres) for the TV edge gate exp(-Delta_d^2 / 2 sigma^2)."""
+    sem_tv_eps: float = 1e-3
+    """Small constant: per-pixel feature-norm clamp + weighted-mean denominator."""
+    opacity_entropy_mult: float = 0.0
+    """Weight of the mean per-Gaussian binary-entropy (alpha polarization) loss (0 = off)."""
+    opacity_entropy_start_iter: int = 1000
+    """Iteration at which the opacity-entropy term turns on (>= refine warmup 500 so it
+    does not collapse the initial alpha~0.1 seed population before geometry is built)."""
+
     # ---- teacher ----
     teacher_kind: str = "clip"
     """'clip' = OpenAI-CLIP patch | 'lseg' | 'superclip' = SLIC+CLIP | 'samclip' = SAM+CLIP."""
@@ -82,6 +103,56 @@ class SemsplatSplatfactoModelConfig(SplatfactoModelConfig):
     """Keep SAM masks whose predicted IoU >= thr (samclip)."""
     teacher_sam_mask_bg: float = 0.5
     """Crop background value 0..1 for CLIP crops (0 black, 0.5 neutral gray)."""
+    # samclip context guidance + mask hygiene + global-first wall folding.
+    # Every toggle below defaults to the pre-change behaviour so existing runs /
+    # checkpoints stay byte-comparable with the baseline.
+    teacher_sam_context_ratio: float = 0.6
+    """Context pad (= ratio of the object bbox side, per side) around CLIP crops."""
+    teacher_sam_context_weight: float = 0.0
+    """Dual-branch CLIP fusion weight; 0 = disabled (baseline gray-bg object-only path)."""
+    teacher_sam_mask_min_comp_px: int = 0
+    """Drop <min_area speck islands inside a SAM mask before encoding (0 = off)."""
+    teacher_sam_depth_dir: Optional[Path] = None
+    """Dir of {cam_idx:06d}.png uint16-mm depth + parent transforms.json (K); None = folding off."""
+    teacher_sam_fold_enabled: bool = False
+    """Master switch for depth-aided plane detection + wall-fragment folding."""
+    teacher_sam_fold_tol_m: float = 0.03
+    """Plane-support residual (m) for RANSAC plane fitting."""
+    teacher_sam_fold_min_plane_frac: float = 0.15
+    """A dominant plane must cover >= this fraction of the valid-depth sample."""
+    teacher_sam_fold_max_plane_n: int = 2
+    """Fit up to this many dominant planes (back wall + side wall)."""
+    teacher_sam_fold_max_area_frac: float = 0.03
+    """Only fold independent fragments <= this frame-area fraction (protects tv/clock)."""
+    teacher_sam_fold_rgb_maxdiff: Optional[float] = 0.15
+    """Albedo veto: fold only if the fragment colour ~ its wall ring (mean |diff|); None = depth only."""
+    # ---- samclip native AMG (automatic mask generator) + contextual CLIP crops ----
+    # Defaults are the NEW behaviour; set teacher-sam-mode grid + teacher-sam-crop-mode gray
+    # to reproduce the legacy 6x6-point/gray-background baseline exactly.
+    teacher_sam_mode: str = "amg"
+    """samclip mask generator: 'amg' = native auto-mask grid | 'grid' = legacy 6x6 per-point loop."""
+    teacher_sam_points_per_side: int = 8
+    """amg: points_per_side^2 grid of single-point SAM prompts (full-image coverage)."""
+    teacher_sam_stability_thr: float = 0.9
+    """amg: keep candidates whose logit stability >= thr."""
+    teacher_sam_stability_offset: float = 1.0
+    """amg: logit offset used by the stability score."""
+    teacher_sam_stability_big_area_frac: float = 0.08
+    """amg: masks >= this frame area fraction are exempt from the stability gate (soft low-texture planes)."""
+    teacher_sam_max_masks: int = 40
+    """amg: cap on kept masks after greedy IoU dedup (bounds the CLIP crop batch)."""
+    teacher_sam_mask_overlap: float = 0.85
+    """amg: greedy IoU dedup overlap threshold."""
+    teacher_sam_amg_long_side: int = 1024
+    """amg: SAM working-res long side (legacy grid path stays at 512)."""
+    teacher_sam_crop_mode: str = "ctx"
+    """samclip CLIP crop: 'ctx' = adaptive blur/darken context window | 'gray' = legacy mask_bg crop."""
+    teacher_sam_ctx_margin: float = 0.25
+    """ctx crop: window expand = margin * mask bbox side, per side."""
+    teacher_sam_ctx_blur_sigma: float = 24.0
+    """ctx crop: gaussian sigma at a 512px window (auto-scaled to window size)."""
+    teacher_sam_ctx_darken: float = 0.0
+    """ctx crop: >0 darkens the non-mask background by this factor instead of blurring."""
     teacher_slic_n_segments: int = 250
     """SLIC superpixel count for the superclip teacher."""
     teacher_slic_compactness: float = 10.0
@@ -102,6 +173,11 @@ class SemsplatSplatfactoModelConfig(SplatfactoModelConfig):
     """Cache teacher grids in fp16 to save VRAM."""
     teacher_cache_max_entries: int = 2000
     """Max cached (image_idx -> grid) entries on GPU (LRU eviction)."""
+
+    # ---- (geometric target injection removed 2026-09-05: ceiling-only arm B′ fixed
+    #      ceiling 0.005→0.280 but flooded walls with "flat white ceiling" text
+    #      (2.6M GT-wall px), mIoU 0.196 < reg 0.240. Rolled back to plain reg;
+    #      mechanism + results recorded in docs/2026-09-05_几何目标灌注.md.) ----
 
 
 class SemsplatModel(SplatfactoModel):
@@ -255,6 +331,12 @@ class SemsplatModel(SplatfactoModel):
             else:
                 f_opac = opacities_crop
 
+            # depth-aware TV needs a per-pixel depth aligned to the feature map; gsplat
+            # "RGB+ED" appends expected z-depth (already alpha-normalized) as the last
+            # channel, so the K feature channels below are untouched by this switch.
+            need_depth = self.config.sem_tv_mult > 0
+            feat_render_mode = "RGB+ED" if need_depth else "RGB"
+            sem_K = sem_crop.shape[-1]
             feat_render, feat_alpha, _ = rasterization(
                 means=f_means,
                 quats=f_quats,
@@ -268,18 +350,23 @@ class SemsplatModel(SplatfactoModel):
                 packed=False,
                 near_plane=0.01,
                 far_plane=1e10,
-                render_mode="RGB",
+                render_mode=feat_render_mode,
                 sh_degree=None,
+                # keep the [N,K+1] blended buffer in a single kernel at the default
+                # K=32 (channel_chunk would otherwise split 33 channels into two)
+                channel_chunk=sem_K + (1 if feat_render_mode == "RGB+ED" else 0),
                 sparse_grad=False,
                 absgrad=False,
                 rasterize_mode=self.config.rasterize_mode,
             )
             # premultiplied output; divide by alpha => alpha-weighted expected feature
-            feat_map = feat_render / feat_alpha.clamp_min(EPS)  # [1,H,W,K]
+            feat_map = feat_render[..., :sem_K] / feat_alpha.clamp_min(EPS)  # [1,H,W,K]
             outputs = {
                 "sem_feature_map": feat_map.squeeze(0),  # [H,W,K]
                 "sem_feature_alpha": feat_alpha.squeeze(0),  # [H,W,1]
             }
+            if feat_render_mode == "RGB+ED":
+                outputs["sem_feature_depth"] = feat_render[..., sem_K:].squeeze(0)  # [H,W,1]
         else:
             outputs = {}
         # =======================================================================
@@ -349,6 +436,28 @@ class SemsplatModel(SplatfactoModel):
                     grid=cfg.teacher_sam_grid,
                     iou_thr=cfg.teacher_sam_iou_thr,
                     mask_bg=cfg.teacher_sam_mask_bg,
+                    context_ratio=cfg.teacher_sam_context_ratio,
+                    context_weight=cfg.teacher_sam_context_weight,
+                    mask_min_comp_px=cfg.teacher_sam_mask_min_comp_px,
+                    depth_dir=str(cfg.teacher_sam_depth_dir) if cfg.teacher_sam_depth_dir else None,
+                    fold_enabled=cfg.teacher_sam_fold_enabled,
+                    fold_tol_m=cfg.teacher_sam_fold_tol_m,
+                    fold_min_plane_frac=cfg.teacher_sam_fold_min_plane_frac,
+                    fold_max_plane_n=cfg.teacher_sam_fold_max_plane_n,
+                    fold_max_area_frac=cfg.teacher_sam_fold_max_area_frac,
+                    fold_rgb_maxdiff=cfg.teacher_sam_fold_rgb_maxdiff,
+                    sam_mode=cfg.teacher_sam_mode,
+                    points_per_side=cfg.teacher_sam_points_per_side,
+                    stability_thr=cfg.teacher_sam_stability_thr,
+                    stability_offset=cfg.teacher_sam_stability_offset,
+                    stability_big_area_frac=cfg.teacher_sam_stability_big_area_frac,
+                    max_masks=cfg.teacher_sam_max_masks,
+                    mask_overlap=cfg.teacher_sam_mask_overlap,
+                    amg_long_side=cfg.teacher_sam_amg_long_side,
+                    crop_mode=cfg.teacher_sam_crop_mode,
+                    ctx_margin=cfg.teacher_sam_ctx_margin,
+                    ctx_blur_sigma=cfg.teacher_sam_ctx_blur_sigma,
+                    ctx_darken=cfg.teacher_sam_ctx_darken,
                     fp16=cfg.teacher_cache_fp16,
                     max_entries=cfg.teacher_cache_max_entries,
                     device=str(self.device),
@@ -373,11 +482,20 @@ class SemsplatModel(SplatfactoModel):
     def _l2norm(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
         return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
 
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
 
         if not self.training:
             return loss_dict
+
+        # ---- alpha polarization: push each Gaussian's opacity toward 0 or 1 so the
+        #      semi-transparent "foggy" edge Gaussians get culled (polish) ----
+        if self.config.opacity_entropy_mult > 0 and self.step >= self.config.opacity_entropy_start_iter:
+            loss_dict["opacity_entropy"] = (
+                opacity_entropy_loss(self.opacities) * self.config.opacity_entropy_mult
+            )
+
         if "sem_feature_map" not in outputs:
             return loss_dict  # semantic phase not active yet
 
@@ -411,20 +529,32 @@ class SemsplatModel(SplatfactoModel):
             mask = mask & (cov > 0.4)
 
         loss_type = self.config.semantic_loss_type
+
+        # per-cell distillation against the L2-normalized teacher target. (This is the
+        # plain "standard reg" loss; the geometric target-injection mechanism that
+        # temporarily overrode ``tgt_n`` was rolled back 2026-09-05 after arm B′ fixed
+        # ceiling 0.005->0.280 but flooded 2.6M GT-wall px with "flat white ceiling"
+        # text (mIoU 0.196 < reg 0.240). See docs/2026-09-05_几何目标灌注.md.)
         if loss_type == "cos":
-            sim = (pred_n * tgt_n).sum(dim=-1)
-            loss = (1.0 - sim)
+            loss = (1.0 - (pred_n * tgt_n).sum(dim=-1))
         elif loss_type == "l1":
             loss = (pred_n - tgt_n).abs().sum(dim=-1)
         elif loss_type == "mse":
             loss = ((pred_n - tgt_n) ** 2).sum(dim=-1)
         else:
             raise ValueError(f"unknown semantic_loss_type {loss_type}")
+        loss_dict["semantic_loss"] = loss[mask.squeeze(-1)].mean() * self.config.semantic_loss_mult
 
-        if mask.any():
-            sem_loss = loss[mask.squeeze(-1)].mean()
-        else:
-            sem_loss = torch.zeros((), device=self.device)
+        # ---- full-res depth-aware TV on the K-dim feature map (speckle removal).
+        #      Gated by rendered-depth continuity so it never smooths across a
+        #      physical edge; runs before the teacher-grid pooling above. ----
+        if self.config.sem_tv_mult > 0:
+            loss_dict["sem_tv"] = depth_aware_tv_loss(
+                feat_map=outputs["sem_feature_map"],  # [H,W,K]
+                alpha=outputs["sem_feature_alpha"],  # [H,W,1]
+                depth=outputs["sem_feature_depth"],  # [H,W,1] (present because RGB+ED)
+                sigma=self.config.sem_tv_depth_sigma,
+                eps=self.config.sem_tv_eps,
+            ) * self.config.sem_tv_mult
 
-        loss_dict["semantic_loss"] = sem_loss * self.config.semantic_loss_mult
         return loss_dict

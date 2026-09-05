@@ -60,7 +60,7 @@ def main() -> None:
     prompts = [p.strip() for p in args.prompts.split(",") if p.strip()]
     cols = _palette(len(prompts))
     meta = json.loads((args.ns / "transforms.json").read_text())
-    byf = {f["file_path"]: f for f in meta["frames"]}
+    byf = {int(Path(f["file_path"]).stem): f for f in meta["frames"]}
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     _, pipeline, _, _ = eval_setup(args.config)
@@ -75,7 +75,7 @@ def main() -> None:
     BG = np.array([28, 28, 28], np.uint8)  # background marker colour
     report = {}
     for idx in args.frames:
-        f = byf[f"images/{idx:06d}.jpg"]
+        f = byf[idx]
         M = np.asarray(f["transform_matrix"], float)[:3, :4]
         cam = Cameras(camera_to_worlds=torch.tensor(M)[None].float().to(model.device),
                       fx=meta["fl_x"], fy=meta["fl_y"], cx=meta["cx"], cy=meta["cy"],

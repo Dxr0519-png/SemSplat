@@ -41,6 +41,9 @@ def main() -> None:
     ap.add_argument("--gt-ids", type=int, nargs="+", required=True)
     ap.add_argument("--frames", type=int, nargs="+", required=True, help="dataset image indices (0..N-1)")
     ap.add_argument("--out", type=Path, default=Path("results/orb_ate/room0_miou.txt"))
+    ap.add_argument("--dump-scores", type=Path, default=None,
+                    help="dir to also write {k:04d}_scores.npz (keys scores/argmax/top_score/margin/valid, "
+                         "argmax 255 = no-alpha) + prompts.json — same schema as semantic_bg.py")
     args = ap.parse_args()
 
     prompts = [p.strip() for p in args.prompts.split(",") if p.strip()]
@@ -56,6 +59,8 @@ def main() -> None:
     emb = torch.stack([encode_text_prompts(prompts, text)[p] for p in prompts], dim=0).to(model.device)
 
     tp = np.zeros(C); fp = np.zeros(C); fn = np.zeros(C)
+    if args.dump_scores is not None:
+        args.dump_scores.mkdir(parents=True, exist_ok=True)
     for k in args.frames:
         f = byf[k]
         M = np.asarray(f["transform_matrix"], float)[:3, :4]
@@ -65,7 +70,18 @@ def main() -> None:
         maps, alpha = scoring.semantic_maps_from_prompts(model, cam, emb)
         maps = maps.detach().cpu().numpy()
         alpha = alpha.detach().cpu().numpy()
+        if maps.ndim == 4:
+            maps, alpha = maps[0], alpha[0]
         valid = alpha[..., 0] > 0.5
+        if args.dump_scores is not None:
+            full_arg = maps.argmax(-1).astype(np.uint8)
+            full_arg[~valid] = 255
+            top2 = np.partition(maps, -2, axis=-1)
+            top_score, sec = top2[..., -1], top2[..., -2]
+            np.savez_compressed(args.dump_scores / f"{k:04d}_scores.npz",
+                                scores=maps.astype(np.float16), argmax=full_arg,
+                                top_score=top_score.astype(np.float16),
+                                margin=(top_score - sec).astype(np.float16), valid=valid)
         pred = maps.argmax(-1)
         pred = pred[valid]
         gtf = args.gt_dir / f"{k}.png"
@@ -91,6 +107,10 @@ def main() -> None:
     txt = "\n".join(lines) + "\n"
     args.out.write_text(txt)
     print(txt)
+    if args.dump_scores is not None:
+        (args.dump_scores / "prompts.json").write_text(
+            json.dumps({"prompts": prompts, "gt_ids": args.gt_ids, "frames": args.frames}, indent=2))
+        print("wrote per-frame npz + prompts.json to", args.dump_scores)
 
 
 if __name__ == "__main__":
