@@ -161,6 +161,14 @@ class SemsplatSplatfactoModelConfig(SplatfactoModelConfig):
     """HuggingFace OpenAI CLIP checkpoint used as dense local-feature teacher (clip kind)."""
     teacher_text_model_name: Optional[str] = None
     """Optional override for the query text encoder; None resolves from teacher_kind."""
+    teacher_clip_backend: str = "openai"
+    """CLIP encoder backend: 'openai' = HF transformers OpenAI checkpoint (default) |
+    'openclip' = open_clip ViT-B/16 laion2b_s34b_b88k (LangSplat 论文同款骨干). Image
+    crop 与 query 文本会同时落到 open_clip 的共享 512 空间, 供 '完全同协议' 评估."""
+    teacher_openclip_arch: str = "ViT-B-16"
+    """open_clip model arch tag (backend='openclip' only)."""
+    teacher_openclip_pretrained: str = "laion2b_s34b_b88k"
+    """open_clip pretrained tag (backend='openclip' only)."""
     teacher_lseg_ckpt: str = "data/checkpoints/lseg/demo_e200.ckpt"
     """Feature-3DGS/isl-org LSeg checkpoint (clip_vitl16_384 + demo_e200)."""
     teacher_lseg_input_long_side: int = 384
@@ -461,6 +469,9 @@ class SemsplatModel(SplatfactoModel):
                     fp16=cfg.teacher_cache_fp16,
                     max_entries=cfg.teacher_cache_max_entries,
                     device=str(self.device),
+                    image_backend=cfg.teacher_clip_backend,
+                    openclip_arch=cfg.teacher_openclip_arch,
+                    openclip_pretrained=cfg.teacher_openclip_pretrained,
                 )
             else:
                 from semsplat.teachers.clip_local_teacher import ClipLocalTeacher

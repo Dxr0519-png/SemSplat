@@ -123,7 +123,17 @@ LSEG_TEXT_MODEL = "openai/clip-vit-base-patch16"
 
 
 def resolve_text_model_name(config) -> str:
-    """Pick the text encoder for a run's teacher kind (see config knobs)."""
+    """Pick the text encoder for a run's teacher kind (see config knobs).
+
+    Returns an opaque string: a HF checkpoint name (OpenAI) for the default
+    ``teacher_clip_backend='openai'``, or an ``openclip:ARCH:PRETRAINED`` marker
+    (LangSplat 同款骨干) for ``teacher_clip_backend='openclip'``. Callers pass the
+    return value straight to :func:`encode_text_prompts`, which dispatches on it.
+    """
+    if getattr(config, "teacher_clip_backend", "openai") == "openclip":
+        arch = getattr(config, "teacher_openclip_arch", "ViT-B-16")
+        pretrained = getattr(config, "teacher_openclip_pretrained", "laion2b_s34b_b88k")
+        return f"openclip:{arch}:{pretrained}"
     if getattr(config, "teacher_text_model_name", None):
         return config.teacher_text_model_name
     if getattr(config, "teacher_kind", "clip") == "lseg":
@@ -145,7 +155,14 @@ def encode_text_prompts(
     per call (the per-call ``load_clip`` would otherwise risk OOM on small GPUs
     when invoked lazily inside training). The tokenizer is still built from
     ``model_name`` (cheap; prompt sets are cached so this runs ~once per run).
+    ``model_name`` starting with ``openclip:ARCH:PRETRAINED`` dispatches to the
+    open_clip text tower (LangSplat 同款骨干), returning embeddings in open_clip's
+    shared space instead of OpenAI's.
     """
+    from semsplat.teachers.openclip_backend import OPENCLIP_PREFIX, openclip_text
+
+    if isinstance(model_name, str) and model_name.startswith(OPENCLIP_PREFIX):
+        return openclip_text(model_name, prompts, device=device)
     from transformers import CLIPTokenizer  # local import kept near usage
 
     tokenizer = CLIPTokenizer.from_pretrained(model_name)

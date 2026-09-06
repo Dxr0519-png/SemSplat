@@ -96,6 +96,10 @@ class SamClipTeacher:
         fp16: bool = True,
         max_entries: int = 2000,
         device: str = "cuda",
+        # ---- CLIP encoder backend (LangSplat 同款 open_clip 实验) ----
+        image_backend: str = "openai",  # 'openai' = HF OpenAI CLIP (默认) | 'openclip'
+        openclip_arch: str = "ViT-B-16",
+        openclip_pretrained: str = "laion2b_s34b_b88k",
         # ---- context prompt guidance (dual-branch CLIP fusion) ----
         context_ratio: float = 0.6,  # context pad = ratio * object bbox side, per side
         context_weight: float = 0.0,  # 0 => disabled (baseline gray-bg object-only path)
@@ -184,7 +188,17 @@ class SamClipTeacher:
         for p in self._sam.parameters():
             p.requires_grad_(False)
 
-        self._clip = load_clip(image_model_name, fp16=fp16, device=str(self.device)).eval()
+        self.image_backend = image_backend
+        self._clip = None
+        self._oc = None
+        if image_backend == "openclip":
+            from semsplat.teachers.openclip_backend import get_openclip_visual
+
+            self._oc = get_openclip_visual(openclip_arch, openclip_pretrained,
+                                           fp16=fp16, device=str(self.device))
+            self.dim = self._oc.dim
+        else:
+            self._clip = load_clip(image_model_name, fp16=fp16, device=str(self.device)).eval()
         self._mean = CLIP_MEAN.to(self.device)
         self._std = CLIP_STD.to(self.device)
 
@@ -372,9 +386,13 @@ class SamClipTeacher:
         def _encode(arr) -> torch.Tensor:
             x = torch.from_numpy(np.stack(arr)).permute(0, 3, 1, 2).to(self.device).float() / 255.0
             x = (x - self._mean[None, :, None, None]) / self._std[None, :, None, None]
-            dtype = next(self._clip.parameters()).dtype
-            out = self._clip.vision_model(pixel_values=x.to(dtype))
-            emb = self._clip.visual_projection(out.pooler_output.to(dtype)).float()
+            if self._oc is not None:
+                # open_clip: 224x224 CLS @ proj, 落进 open_clip 共享空间 (LangSplat 同款骨干)
+                emb = self._oc.encode_tensor(x)
+            else:
+                dtype = next(self._clip.parameters()).dtype
+                out = self._clip.vision_model(pixel_values=x.to(dtype))
+                emb = self._clip.visual_projection(out.pooler_output.to(dtype)).float()
             return F.normalize(emb, dim=-1).detach().cpu()  # [K,512]
 
         emb = _encode(crops)
